@@ -11,10 +11,10 @@ import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
 from competitive.coverage import coverage_reason, latest_shared_financial_period
-from competitive.executive import executive_analysis, executive_angle, executive_evidence
+from competitive.executive import clarification, executive_analysis, executive_angle, executive_evidence, question_metrics
 from competitive.financial import TAGS, Metric, aligned, change, comparable_peers, margin
 from competitive.industry import AVIATION, HOSPITALITY, TECHNOLOGY
-from competitive.intelligence import SIGNALS, brief, load, ollama_chat, research_topics, scenario
+from competitive.intelligence import SIGNALS, load, ollama_chat, research_topics, scenario
 from competitive.report import report_pdf
 from competitive.sectors import (BRAND, DRIVERS, SECTORS, SECTOR_ISSUERS, TRAVEL_METRICS,
                                  benchmark_status, financial_yoy, sector_scenario, trend_cohorts)
@@ -172,6 +172,11 @@ if research_page:
             st.warning(f"Model test failed. {exc}")
     if model and st.session_state.get("tested_model") != model:
         st.caption("Test this model before enabling AI reasoning. Calculated briefings remain available.")
+
+if research_page and (prompt := clarification(question)):
+    st.subheader("Clarify your question")
+    st.info(prompt)
+    st.stop()
 
 requested_years = list(range(year - lookback, year + 1)) if year else None
 attempted_issuers = st.session_state.setdefault("attempted_issuers", set())
@@ -414,9 +419,8 @@ if research_page:
     result_key = (scope, evidence.period, question, model)
     observations, limitations = executive_evidence(evidence, tickers, year, question)
     if analyze:
-        lines, sources = brief(evidence, tickers, year, quarter, question)
         response = error = None
-        if model and not sources:
+        if model and not observations:
             error = "AI reasoning is unavailable for this question because there are no verified sources."
         elif model and st.session_state.get("tested_model") == model:
             try:
@@ -424,94 +428,75 @@ if research_page:
                     response = executive_analysis(question, observations, model)
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 error = f"AI reasoning is disabled for this request. Ollama could not return a validated answer. {exc}"
-        result = {"key": result_key, "scope": scope, "question": question, "model": model, "lines": lines,
-                  "sources": sources, "response": response, "error": error,
+        result = {"key": result_key, "scope": scope, "question": question, "model": model, "response": response, "error": error,
                   "observations": observations, "limitations": limitations, "candidates": candidates}
         st.session_state.research_result = result
     matching_result = result and result["key"] == result_key
     if page == "AI Executive Briefing" or matching_result:
-        lines, sources = ((result["lines"], result["sources"]) if matching_result else
-                          brief(evidence, tickers, year, quarter, question))
         if matching_result and result["error"]:
             st.warning(result["error"])
         assessment = result["response"] if matching_result else None
         if matching_result:
             observations = result.get("observations", observations)
             limitations = result.get("limitations", limitations)
-        if isinstance(assessment, dict):
-            def cited_statement(statement, key):
-                references = []
-                for fact in observations[key].sources:
-                    ref = f"[{fact.ticker}, {fact.start or 'as of'} to {fact.end}]({fact.url})"
-                    if ref not in references:
-                        references.append(ref)
-                st.markdown(statement.replace("$", r"\$") + " " + " · ".join(references))
+        def cited_statement(statement, key):
+            references = list(dict.fromkeys(
+                f"[{fact.ticker}, {fact.start or 'as of'} to {fact.end}]({fact.url})"
+                for fact in observations[key].sources
+            ))
+            st.markdown(statement.replace("$", r"\$") + " " + " · ".join(references))
 
-            lead = assessment["conclusion"]
-            st.subheader("Executive conclusion")
-            st.caption("Evidence selected and prioritized by the local model")
-            topics = {"growth": "Revenue growth", "operating": "Operating margin", "net": "Net margin",
-                      "demand": "Demand", "capacity": "Capacity", "cash": "Cash generation",
-                      "segment": "Segment performance", "liquidity": "Liquidity", "leverage": "Debt",
-                      "signals": "Strategic commentary"}
-            focus = topics[lead.split("_", 1)[0]]
-            if {"growth", "net"} <= set(assessment["findings"]):
-                growth_leader = observations["growth"].leader
-                profit_leader = observations["net"].leader
-                if growth_leader and profit_leader and growth_leader != profit_leader:
-                    st.write(f"On reported results, {label(growth_leader).split(" · ")[0]} has the stronger growth case "
-                             f"and {label(profit_leader).split(" · ")[0]} has the stronger profitability case. "
-                             "The momentum judgment depends on which measure matters more to the decision.")
-                else:
-                    st.write(f"{focus} is the lead indicator for this question. The findings below separate "
-                             "the growth and profitability evidence.")
-            else:
-                st.write(f"{focus} is the lead indicator for this question.")
-            st.subheader("Key findings")
-            for key in assessment["findings"]:
-                cited_statement(observations[key].text, key)
-            st.subheader("Strategic implications")
-            for key in dict.fromkeys((lead, *assessment["recommendations"])):
-                cited_statement(executive_angle(key)[0], key)
-            st.subheader("Management considerations")
-            for key in assessment["recommendations"]:
-                cited_statement(observations[key].recommendation or executive_angle(key)[1], key)
-            st.subheader("Sources and limitations")
-            st.write("This comparison describes one reporting window. It cannot isolate the causes of margin or growth differences.")
-            for limitation in limitations:
-                st.write(limitation)
+        requested = question_metrics(question)
+        lead = requested[0] if requested else next(iter(observations), None)
+        if lead not in observations:
+            lead = None
+        unavailable = (f"No verified evidence for the requested measure. {limitations[0]}"
+                       if requested and limitations else
+                       "No verified evidence answers this question for the selected companies and period.")
+        st.subheader("Executive conclusion")
+        st.caption("Deterministic analysis — calculated directly from verified evidence, no AI interpretation applied.")
+        if lead:
+            cited_statement(observations[lead].text, lead)
         else:
-            st.subheader("Executive conclusion")
-            st.caption("Deterministic analysis — calculated directly from verified evidence, no AI interpretation applied.")
-            lead_observation = next(iter(observations.values()), None)
-            if lead_observation:
-                st.write(lead_observation.text)
+            st.write(unavailable)
+
+        model_used = isinstance(assessment, dict)
+        selected_keys = list(observations)
+        if model_used:
+            st.caption("Local Ollama interpretation prioritizes verified findings and management considerations below.")
+            selected_keys = list(dict.fromkeys((assessment["conclusion"], *assessment["findings"], *selected_keys)))
+        findings = [key for key in selected_keys if key != lead]
+        if findings:
             st.subheader("Key findings")
-            for observation in observations.values():
-                st.write(observation.text)
-            recommended = [observation.recommendation for observation in observations.values()
-                          if observation.recommendation]
-            if recommended:
-                st.subheader("Management considerations")
-                for recommendation in recommended:
-                    st.write(recommendation)
-            st.subheader("Sources and limitations")
-            for limitation in limitations:
-                st.write(limitation)
-            if not limitations:
-                st.caption("No additional comparability limitations were flagged for this selection.")
+            for key in findings:
+                cited_statement(observations[key].text, key)
+        recommendations = assessment["recommendations"] if model_used else [
+            key for key in selected_keys if observations[key].recommendation]
+        if model_used:
+            st.subheader("Strategic implications")
+            for key in dict.fromkeys((assessment["conclusion"], *recommendations)):
+                cited_statement(executive_angle(key)[0], key)
+        if recommendations:
+            st.subheader("Management considerations")
+            for key in recommendations:
+                cited_statement(observations[key].recommendation or executive_angle(key)[1], key)
+        st.subheader("Sources and limitations")
+        for limitation in limitations:
+            st.write(limitation)
+        if observations:
+            st.caption("Reported results describe performance. Establishing its causes requires additional evidence.")
+        sources = list(dict.fromkeys(fact.url for item in observations.values() for fact in item.sources))
         with st.expander("Supporting calculations and source details"):
             st.caption("Revenue growth compares reported revenue with the equivalent prior-year period. "
                        "Margins divide the relevant income measure by reported revenue.")
-            for line in lines:
-                st.write(line)
             for number, url in enumerate(sources, 1):
                 st.caption(f"[{number}] [Evidence source]({url})")
             source_details = list(dict.fromkeys(
                 fact for item in observations.values() for fact in item.sources))
             if source_details:
                 show_table([{"Ticker": fact.ticker, "Measure": fact.name, "Start": fact.start,
-                             "End": fact.end, "Published": fact.published, "URL": fact.url}
+                             "End": fact.end, "Published": fact.published,
+                             "Value": fact.value if fact.unit else None, "Unit": fact.unit, "URL": fact.url}
                             for fact in source_details])
         if page == "AI Executive Briefing":
             try:
@@ -527,32 +512,20 @@ if research_page:
                             references.append(reference)
                     return statement + " " + " · ".join(references)
 
-                selected_keys = assessment["findings"] if isinstance(assessment, dict) else list(observations)
-                financial_keys = [key for key in selected_keys if key.split("_", 1)[0] in {"growth", "operating", "net", "cash", "liquidity", "leverage"}]
-                operating_keys = [key for key in selected_keys if key not in financial_keys]
-                lead_keys = ([assessment["conclusion"]] if isinstance(assessment, dict) else financial_keys[:2])
-                recommendations = assessment["recommendations"] if isinstance(assessment, dict) else financial_keys[:2]
-                strategic_notes = []
-                for ticker in tickers:
-                    for kind, snippet, url, published, _ in evidence.signals.get(ticker, [])[:1]:
-                        if url not in report_sources:
-                            report_sources.append(url)
-                        strategic_notes.append(f"{ticker} issuer statement, {published}. {kind}. "
-                                               f"{snippet} [{report_sources.index(url) + 1}]")
                 sections = [
-                    ("Executive summary", [report_statement(observations[key].text, key) for key in lead_keys]),
+                    ("Executive summary", [report_statement(observations[lead].text, lead)] if lead else
+                     [unavailable]),
                     ("Company comparison", [", ".join(label(ticker) for ticker in tickers)]),
-                    ("Financial performance", [report_statement(observations[key].text, key) for key in financial_keys]),
-                    ("Operating performance", [report_statement(observations[key].text, key) for key in operating_keys]),
-                    ("Strategic findings", [report_statement(executive_angle(key)[0], key) for key in recommendations] + strategic_notes),
-                    ("Limitations", limitations + [report_statement(
-                        observations[key].recommendation or executive_angle(key)[1], key) for key in operating_keys[:1]]),
+                    ("Supporting findings", [report_statement(observations[key].text, key) for key in findings]),
+                    ("Strategic implications", [report_statement(executive_angle(key)[0], key)
+                                                for key in recommendations] if model_used else []),
+                    ("Limitations", limitations),
                     ("Management considerations", [report_statement(
                         observations[key].recommendation or executive_angle(key)[1], key) for key in recommendations]),
                     ("Methodology", ["Margins divide reported income by reported revenue. Revenue growth compares equivalent prior-year quarters. "
                                      "Source records retain each issuer's actual dates, accounting concepts and units."]),
                 ]
-                status = "Model-prioritized analysis" if isinstance(assessment, dict) else "Deterministic analysis"
+                status = "Deterministic conclusion with Ollama-prioritized supporting evidence" if model_used else "Deterministic analysis"
                 title = f"Q{quarter} {year} executive briefing"
                 if "sections" in signature(report_pdf).parameters:
                     pdf = report_pdf(title, [status, question], report_sources, sections=sections)
