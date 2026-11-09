@@ -1,0 +1,5 @@
+streamlit==1.66.1
+pandas==2.3.3
+plotly==6.9.0
+reportlab==4.5.1
+pypdf==6.21.4
